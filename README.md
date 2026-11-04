@@ -12,7 +12,7 @@ Aplicativo Mobile-First estilo "iFood de Reservas / TheFork" focado em **Brusque
 
 ---
 
-## Como Rodar o Projeto (No Trabalho ou em Casa)
+## Como Rodar o Projeto
 
 ### Opção Rápida (Sem precisar instalar nada)
 Basta abrir o arquivo `abrir-app.html` diretamente no navegador (ou pressionar `F5` no VS Code / Antigravity).
