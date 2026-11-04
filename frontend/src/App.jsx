@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   MapPin,
   TicketPercent,
@@ -23,6 +23,9 @@ import {
   RefreshCw,
   ShieldCheck,
   AlertCircle,
+  Database,
+  Globe,
+  Loader2,
 } from "lucide-react";
 
 const API_BASE_URL = "http://localhost:8000";
@@ -30,7 +33,6 @@ const STORAGE_KEY_RESERVAS = "mesabrusque_minhas_reservas_v1";
 const STORAGE_KEY_RESTAURANTES = "mesabrusque_restaurantes_demo_v1";
 const STORAGE_KEY_MESAS = "mesabrusque_mesas_demo_v1";
 
-// Dados iniciais para Modo Demo (caso a API FastAPI não esteja rodando)
 const RESTAURANTES_INICIAIS = [
   {
     id: 1,
@@ -138,8 +140,74 @@ const POSICOES_MAPA = [
   { top: "56%", left: "74%" },
 ];
 
+const SUGESTOES_IA = [
+  "Italiano romântico para jantar hoje em Brusque",
+  "Hambúrguer barato com amigos em Brusque",
+  "Frutos do mar sofisticado na praia em Itajaí",
+  "Comida alemã tradicional em família",
+];
+
+// Fallback local para extração semântica caso a API FastAPI não esteja aberta
+function extrairParametrosFallback(texto) {
+  const q = texto.toLowerCase();
+  let cuisine = "variada";
+  for (const [termo, valor] of [
+    ["italian", "italiana"],
+    ["massa", "italiana"],
+    ["pizza", "pizzaria"],
+    ["japon", "japonesa"],
+    ["sushi", "japonesa"],
+    ["alem", "alemã"],
+    ["hamburg", "hamburgueria"],
+    ["burger", "hamburgueria"],
+    ["frutos do mar", "frutos do mar"],
+    ["peixe", "frutos do mar"],
+    ["churrasc", "churrascaria"],
+  ]) {
+    if (q.includes(termo)) {
+      cuisine = valor;
+      break;
+    }
+  }
+
+  let price_level = 2;
+  if (["barato", "econômico", "economico", "em conta"].some((w) => q.includes(w))) {
+    price_level = 1;
+  } else if (["sofisticado", "especial", "fino"].some((w) => q.includes(w))) {
+    price_level = 3;
+  } else if (["luxo", "caro", "alta gastronomia"].some((w) => q.includes(w))) {
+    price_level = 4;
+  }
+
+  let vibe = "casual";
+  for (const [termo, valor] of [
+    ["romântic", "romântico"],
+    ["romantic", "romântico"],
+    ["casal", "romântico"],
+    ["família", "família"],
+    ["familia", "família"],
+    ["amigos", "happy hour"],
+    ["happy hour", "happy hour"],
+    ["tranquil", "tranquilo"],
+  ]) {
+    if (q.includes(termo)) {
+      vibe = valor;
+      break;
+    }
+  }
+
+  const location =
+    q.includes("itajaí") ||
+    q.includes("itajai") ||
+    q.includes("praia") ||
+    cuisine === "frutos do mar"
+      ? "Itajaí"
+      : "Brusque";
+
+  return { cuisine, price_level, vibe, location };
+}
+
 export default function App() {
-  // Navegação principal: "explorar" | "reservas" | "restaurante"
   const [abaPrincipal, setAbaPrincipal] = useState("explorar");
   const [usandoApiReal, setUsandoApiReal] = useState(false);
 
@@ -156,7 +224,12 @@ export default function App() {
   const [busca, setBusca] = useState("");
   const [restauranteFocadoMapa, setRestauranteFocadoMapa] = useState(null);
 
-  // Carteira Persistente de Reservas (localStorage + sincronização com API)
+  // Estados da Busca com IA (Linguagem Natural + Cache + Google Places)
+  const [carregandoIA, setCarregandoIA] = useState(false);
+  const [resultadoIA, setResultadoIA] = useState(null);
+  const cacheMemoriaLocalRef = useRef({});
+
+  // Carteira Persistente de Reservas
   const [minhasReservas, setMinhasReservas] = useState(() => {
     try {
       const salvas = localStorage.getItem(STORAGE_KEY_RESERVAS);
@@ -176,7 +249,7 @@ export default function App() {
     }
   });
 
-  // Estados do Fluxo de Reserva do Cliente
+  // Estados do Fluxo de Reserva
   const [restauranteSelecionado, setRestauranteSelecionado] = useState(null);
   const [dataReserva, setDataReserva] = useState(
     new Date().toISOString().split("T")[0]
@@ -193,13 +266,10 @@ export default function App() {
   const [erroReserva, setErroReserva] = useState(null);
   const [reservaConfirmada, setReservaConfirmada] = useState(null);
 
-  // Modal de visualização de Voucher existente
   const [voucherDetalhe, setVoucherDetalhe] = useState(null);
   const [buscaVoucherCliente, setBuscaVoucherCliente] = useState("");
 
-  // ==========================================
-  // ESTADOS DO PAINEL DO RESTAURANTE (PASSO 2)
-  // ==========================================
+  // Estados do Painel do Restaurante Parceiro
   const [restauranteParceiroId, setRestauranteParceiroId] = useState(1);
   const [dataFiltroPainel, setDataFiltroPainel] = useState(
     new Date().toISOString().split("T")[0]
@@ -209,18 +279,16 @@ export default function App() {
   const [codigoCheckinInput, setCodigoCheckinInput] = useState("");
   const [feedbackPainel, setFeedbackPainel] = useState(null);
 
-  // Edição de cupom e nova mesa no painel
   const [cupomTextoEdit, setCupomTextoEdit] = useState("");
   const [cupomDescontoEdit, setCupomDescontoEdit] = useState(20);
   const [novaMesaNome, setNovaMesaNome] = useState("");
   const [novaMesaCap, setNovaMesaCap] = useState(4);
 
-  // Persiste reservas e restaurantes demo no localStorage
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY_RESERVAS, JSON.stringify(minhasReservas));
     } catch {
-      // ignora erro de quota
+      // ignora
     }
   }, [minhasReservas]);
 
@@ -245,7 +313,6 @@ export default function App() {
     }
   }, [mesasDemo]);
 
-  // Carrega restaurantes da API FastAPI
   const carregarRestaurantes = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE_URL}/restaurantes`);
@@ -266,7 +333,103 @@ export default function App() {
     carregarRestaurantes();
   }, [carregarRestaurantes]);
 
-  // Calcula disponibilidade no Modo Demo ou busca da API Real
+  // ==========================================
+  // EXECUÇÃO DA BUSCA EM LINGUAGEM NATURAL COM IA
+  // ==========================================
+  const executarBuscaIA = async (e, textoForcado) => {
+    if (e) e.preventDefault();
+    const consulta = (textoForcado ?? busca).trim();
+    if (!consulta) return;
+    if (textoForcado) setBusca(textoForcado);
+
+    setCarregandoIA(true);
+
+    try {
+      if (usandoApiReal) {
+        const res = await fetch(`${API_BASE_URL}/api/search`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: consulta }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setResultadoIA(data);
+          return;
+        }
+      }
+
+      // Fallback local com o mesmo fluxo: Extração JSON -> Cache em Memória -> Google Places Cards
+      await new Promise((r) => setTimeout(r, 380));
+      const extracted_params = extrairParametrosFallback(consulta);
+      const cache_key = JSON.stringify(extracted_params);
+
+      if (cacheMemoriaLocalRef.current[cache_key]) {
+        setResultadoIA({
+          query_original: consulta,
+          extracted_params,
+          cached: true,
+          cache_key,
+          results: cacheMemoriaLocalRef.current[cache_key],
+        });
+      } else {
+        const mapaCat = {
+          italiana: "Italiano",
+          alemã: "Alemão",
+          hamburgueria: "Hamburgueria",
+          japonesa: "Japonês",
+        };
+        const catAlvo = mapaCat[extracted_params.cuisine];
+        const parceirosCompativeis =
+          extracted_params.location === "Brusque"
+            ? restaurantes
+                .filter(
+                  (r) =>
+                    !catAlvo ||
+                    r.categoria.toLowerCase() === catAlvo.toLowerCase() ||
+                    extracted_params.cuisine === "variada"
+                )
+                .map((r) => ({
+                  name: r.nome,
+                  rating: r.avaliacao,
+                  formatted_address: `${r.endereco} - ${r.bairro}, Brusque - SC`,
+                  price_level: extracted_params.price_level,
+                  parceiro_id: r.id,
+                  cupom_destaque: r.cupom_destaque,
+                  desconto_percentual: r.desconto_percentual,
+                }))
+            : [];
+
+        const cardsGooglePlaces = [
+          ...parceirosCompativeis,
+          {
+            name: `Reserva ${extracted_params.location} — Cozinha ${extracted_params.cuisine.toUpperCase()}`,
+            rating: 4.8,
+            formatted_address: `Av. Beira Rio, 540 - Centro, ${extracted_params.location} - SC`,
+            price_level: extracted_params.price_level,
+          },
+          {
+            name: `Bistrô & Osteria (${extracted_params.vibe})`,
+            rating: 4.7,
+            formatted_address: `Rua Hercílio Luz, 315 - Centro, ${extracted_params.location} - SC`,
+            price_level: extracted_params.price_level,
+          },
+        ];
+
+        cacheMemoriaLocalRef.current[cache_key] = cardsGooglePlaces;
+        setResultadoIA({
+          query_original: consulta,
+          extracted_params,
+          cached: false,
+          cache_key,
+          results: cardsGooglePlaces,
+        });
+      }
+    } finally {
+      setCarregandoIA(false);
+    }
+  };
+
+  // Disponibilidade por horário
   const carregarDisponibilidadeHorarios = useCallback(
     async (restaurante, data, pessoas) => {
       if (!restaurante) return;
@@ -290,7 +453,6 @@ export default function App() {
           }
         }
 
-        // Cálculo local (Modo Demo)
         const listaMesas = (mesasDemo[restaurante.id] || []).filter(
           (m) => m.ativa && m.capacidade >= Number(pessoas)
         );
@@ -344,7 +506,6 @@ export default function App() {
     carregarDisponibilidadeHorarios,
   ]);
 
-  // Carrega dados do Painel do Restaurante quando selecionado
   const carregarDadosPainelRestaurante = useCallback(async () => {
     const restAtual = restaurantes.find(
       (r) => r.id === Number(restauranteParceiroId)
@@ -362,19 +523,14 @@ export default function App() {
           ),
           fetch(`${API_BASE_URL}/restaurantes/${restauranteParceiroId}/mesas`),
         ]);
-        if (resReservas.ok) {
-          setReservasPainel(await resReservas.json());
-        }
-        if (resMesas.ok) {
-          setMesasPainel(await resMesas.json());
-        }
+        if (resReservas.ok) setReservasPainel(await resReservas.json());
+        if (resMesas.ok) setMesasPainel(await resMesas.json());
         return;
       } catch {
         // fallback abaixo
       }
     }
 
-    // Modo Demo: filtra reservas do localStorage e mesasDemo
     const filtradas = minhasReservas.filter(
       (r) =>
         Number(r.restaurante_id) === Number(restauranteParceiroId) &&
@@ -403,6 +559,8 @@ export default function App() {
     const matchCategoria =
       categoriaAtiva === "Todos" || r.categoria === categoriaAtiva;
     const matchBusca =
+      !busca.trim() ||
+      resultadoIA !== null ||
       r.nome.toLowerCase().includes(busca.toLowerCase()) ||
       r.bairro.toLowerCase().includes(busca.toLowerCase()) ||
       r.categoria.toLowerCase().includes(busca.toLowerCase());
@@ -429,9 +587,6 @@ export default function App() {
     setErroReserva(null);
   };
 
-  // ==========================================
-  // AÇÕES DO CLIENTE: CRIAR E CANCELAR RESERVA
-  // ==========================================
   const confirmarReserva = async (e) => {
     e.preventDefault();
     setCarregandoReserva(true);
@@ -469,7 +624,6 @@ export default function App() {
           ),
         ]);
       } else {
-        // Validação de disponibilidade e regra de horário ocioso no Modo Demo
         if (!slotSelecionadoInfo.disponivel) {
           throw new Error(
             "Não há mesas disponíveis para essa quantidade de pessoas neste horário."
@@ -556,38 +710,6 @@ export default function App() {
     }
   };
 
-  const buscarReservasRemotasCliente = async (e) => {
-    e.preventDefault();
-    if (!buscaVoucherCliente.trim()) return;
-    const termo = buscaVoucherCliente.trim();
-
-    if (usandoApiReal) {
-      try {
-        const param = termo.toUpperCase().startsWith("BRQ-")
-          ? `codigo=${encodeURIComponent(termo)}`
-          : `email=${encodeURIComponent(termo)}`;
-        const res = await fetch(`${API_BASE_URL}/reservas?${param}`);
-        if (res.ok) {
-          const encontradas = await res.json();
-          if (encontradas.length > 0) {
-            setMinhasReservas((prev) => {
-              const mapa = new Map();
-              [...encontradas, ...prev].forEach((item) =>
-                mapa.set(item.codigo_confirmacao, item)
-              );
-              return Array.from(mapa.values());
-            });
-          }
-        }
-      } catch {
-        // mantém filtro local
-      }
-    }
-  };
-
-  // ==========================================
-  // AÇÕES DO PAINEL RESTAURANTE (CHECK-IN, CUPOM, MESAS)
-  // ==========================================
   const realizarCheckinRestaurante = async (codigoAlvo) => {
     const codigo = (codigoAlvo || codigoCheckinInput).trim().toUpperCase();
     if (!codigo) return;
@@ -618,15 +740,11 @@ export default function App() {
         const alvo = minhasReservas.find(
           (r) => r.codigo_confirmacao.toUpperCase() === codigo
         );
-        if (!alvo) {
-          throw new Error("Voucher não encontrado na base.");
-        }
-        if (alvo.status === "CANCELADA") {
+        if (!alvo) throw new Error("Voucher não encontrado na base.");
+        if (alvo.status === "CANCELADA")
           throw new Error("Este voucher foi cancelado.");
-        }
-        if (alvo.status === "CONCLUIDA") {
+        if (alvo.status === "CONCLUIDA")
           throw new Error("Check-in já foi realizado para este voucher.");
-        }
 
         setMinhasReservas((prev) =>
           prev.map((r) =>
@@ -765,7 +883,6 @@ export default function App() {
     setNovaMesaNome("");
   };
 
-  // Utilitários para WhatsApp e Google Maps
   const gerarLinkWhatsAppVoucher = (reserva) => {
     const texto = [
       `🍽️ *Voucher MesaBrusque — ${reserva.codigo_confirmacao}*`,
@@ -796,15 +913,14 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-100 flex justify-center">
-      {/* Container Mobile-First */}
       <div className="w-full max-w-md bg-white min-h-screen shadow-2xl flex flex-col relative pb-20">
-        {/* HEADER */}
+        {/* HEADER COM BUSCA INTELIGENTE EM LINGUAGEM NATURAL */}
         <header className="bg-gradient-to-r from-orange-600 to-rose-600 text-white p-4 rounded-b-3xl shadow-md">
           <div className="flex items-center justify-between mb-3">
             <div>
               <div className="flex items-center gap-1.5 text-orange-100 text-xs font-medium">
                 <MapPin className="w-3.5 h-3.5" />
-                <span>Brusque, Santa Catarina</span>
+                <span>Brusque & Região, SC</span>
               </div>
               <h1 className="text-xl font-extrabold tracking-tight flex items-center gap-1.5">
                 <Utensils className="w-5 h-5" />
@@ -822,26 +938,205 @@ export default function App() {
             </span>
           </div>
 
-          {/* Barra de Busca (apenas na aba Explorar) */}
           {abaPrincipal === "explorar" && (
-            <div className="relative">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-3" />
-              <input
-                type="text"
-                value={busca}
-                onChange={(e) => setBusca(e.target.value)}
-                placeholder="Buscar restaurante, bairro ou culinária..."
-                className="w-full pl-10 pr-4 py-2.5 rounded-2xl bg-white text-slate-800 text-sm placeholder-slate-400 focus:outline-none shadow-inner"
-              />
+            <div className="space-y-2">
+              <form onSubmit={executarBuscaIA} className="flex gap-1.5">
+                <div className="relative flex-1">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                  <input
+                    type="text"
+                    value={busca}
+                    onChange={(e) => {
+                      setBusca(e.target.value);
+                      if (!e.target.value.trim()) setResultadoIA(null);
+                    }}
+                    placeholder="Pergunte à IA (ex: italiano romântico barato)..."
+                    className="w-full pl-9 pr-3 py-2.5 rounded-2xl bg-white text-slate-800 text-xs placeholder-slate-400 focus:outline-none shadow-inner"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={carregandoIA || !busca.trim()}
+                  className="bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-bold px-3.5 py-2.5 rounded-2xl flex items-center gap-1 shrink-0 shadow"
+                >
+                  {carregandoIA ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="w-3.5 h-3.5 text-orange-400" />
+                  )}
+                  <span>IA</span>
+                </button>
+              </form>
+
+              {/* Pílulas de Sugestão de Linguagem Natural */}
+              <div className="flex gap-1.5 overflow-x-auto pb-0.5 no-scrollbar">
+                {SUGESTOES_IA.map((sug) => (
+                  <button
+                    key={sug}
+                    type="button"
+                    onClick={() => executarBuscaIA(null, sug)}
+                    className="text-[10px] bg-white/15 hover:bg-white/25 text-white px-2.5 py-1 rounded-full whitespace-nowrap transition"
+                  >
+                    ✨ {sug}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
         </header>
 
         {/* =========================================================
-            ABA 1: EXPLORAR MAPA & RESTAURANTES (MODO CLIENTE)
+            ABA 1: EXPLORAR (BUSCA IA + MAPA + RESERVAS C/ CUPOM)
            ========================================================= */}
         {abaPrincipal === "explorar" && (
           <>
+            {/* PAINEL DE RESULTADO DA BUSCA COM IA (LLM + CACHE + GOOGLE PLACES) */}
+            {resultadoIA && (
+              <section className="px-4 mt-4">
+                <div className="bg-slate-900 text-white rounded-2xl p-3.5 shadow-md space-y-3 border border-slate-800">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-orange-400 flex items-center gap-1">
+                      <Sparkles className="w-3.5 h-3.5" />
+                      Extração IA & Google Places
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      {resultadoIA.cached ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                          <Database className="w-3 h-3" />
+                          CACHE HIT
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                          <Globe className="w-3 h-3" />
+                          GOOGLE PLACES
+                        </span>
+                      )}
+                      <button
+                        onClick={() => {
+                          setResultadoIA(null);
+                          setBusca("");
+                        }}
+                        className="p-1 text-slate-400 hover:text-white"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* JSON Extraído pelo LLM */}
+                  <div className="grid grid-cols-4 gap-1.5 text-center">
+                    <div className="bg-slate-800 rounded-xl p-1.5">
+                      <span className="text-[9px] text-slate-400 uppercase block">
+                        cuisine
+                      </span>
+                      <span className="text-[11px] font-extrabold capitalize">
+                        {resultadoIA.extracted_params.cuisine}
+                      </span>
+                    </div>
+                    <div className="bg-slate-800 rounded-xl p-1.5">
+                      <span className="text-[9px] text-slate-400 uppercase block">
+                        price_level
+                      </span>
+                      <span className="text-[11px] font-extrabold text-emerald-400">
+                        {"$".repeat(resultadoIA.extracted_params.price_level)} (
+                        {resultadoIA.extracted_params.price_level})
+                      </span>
+                    </div>
+                    <div className="bg-slate-800 rounded-xl p-1.5">
+                      <span className="text-[9px] text-slate-400 uppercase block">
+                        vibe
+                      </span>
+                      <span className="text-[11px] font-extrabold capitalize">
+                        {resultadoIA.extracted_params.vibe}
+                      </span>
+                    </div>
+                    <div className="bg-slate-800 rounded-xl p-1.5">
+                      <span className="text-[9px] text-slate-400 uppercase block">
+                        location
+                      </span>
+                      <span className="text-[11px] font-extrabold text-orange-400">
+                        {resultadoIA.extracted_params.location}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Cartões Visuais (Cards) da Busca IA / Google Places */}
+                  <div className="space-y-2 pt-1">
+                    {resultadoIA.results.map((place, idx) => {
+                      const parceiro = restaurantes.find(
+                        (r) =>
+                          r.id === place.parceiro_id ||
+                          r.nome.toLowerCase() === place.name.toLowerCase()
+                      );
+
+                      return (
+                        <div
+                          key={`${place.name}-${idx}`}
+                          className="bg-white text-slate-900 rounded-xl p-3 shadow-sm border border-slate-100 space-y-2"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <h4 className="text-xs font-extrabold text-slate-900">
+                                {place.name}
+                              </h4>
+                              <p className="text-[11px] text-slate-500 mt-0.5">
+                                {place.formatted_address}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <span className="text-[10px] font-mono font-bold bg-slate-100 px-2 py-0.5 rounded text-emerald-700">
+                                {"$".repeat(place.price_level || 2)}
+                              </span>
+                              {place.rating && (
+                                <span className="text-[11px] font-extrabold bg-amber-50 border border-amber-200 text-amber-800 px-2 py-0.5 rounded flex items-center gap-0.5">
+                                  <Star className="w-3 h-3 text-amber-500 fill-amber-500" />
+                                  {Number(place.rating).toFixed(1)}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="flex items-center justify-between pt-1.5 border-t border-slate-100">
+                            {parceiro ? (
+                              <>
+                                <span className="text-[10px] font-bold text-emerald-700">
+                                  🎁 {parceiro.cupom_destaque || "Parceiro MesaBrusque"}
+                                </span>
+                                <button
+                                  onClick={() => abrirFluxoReserva(parceiro)}
+                                  className="bg-orange-600 text-white text-[11px] font-bold px-3 py-1 rounded-lg"
+                                >
+                                  Reservar Mesa →
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <span className="text-[10px] text-slate-400">
+                                  Resultado Google Places ({resultadoIA.extracted_params.location})
+                                </span>
+                                <a
+                                  href={gerarLinkGoogleMaps(
+                                    place.formatted_address,
+                                    ""
+                                  )}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="text-[11px] font-bold text-orange-600 hover:underline flex items-center gap-1"
+                                >
+                                  <span>Ver no Mapa</span>
+                                  <ExternalLink className="w-3 h-3" />
+                                </a>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </section>
+            )}
+
             {/* MAPA INTERATIVO DE BRUSQUE */}
             <section className="px-4 mt-4">
               <div className="flex items-center justify-between mb-2">
@@ -1025,11 +1320,11 @@ export default function App() {
               </section>
             )}
 
-            {/* LISTAGEM DE RESTAURANTES */}
+            {/* LISTAGEM DE RESTAURANTES PARCEIROS */}
             <section className="px-4 mt-4 flex-1 space-y-3.5">
               <div className="flex items-center justify-between">
                 <h2 className="text-sm font-extrabold text-slate-800">
-                  Restaurantes com Benefícios Hoje
+                  Restaurantes Parceiros em Brusque
                 </h2>
                 <span className="text-xs text-slate-400">
                   {restaurantesFiltrados.length} locais
@@ -1108,7 +1403,7 @@ export default function App() {
         )}
 
         {/* =========================================================
-            ABA 2: CARTEIRA DE VOUCHERS ("MINHAS RESERVAS")
+            ABA 2: CARTEIRA DE VOUCHERS ("MEUS VOUCHERS")
            ========================================================= */}
         {abaPrincipal === "reservas" && (
           <section className="px-4 mt-4 flex-1 space-y-4">
@@ -1122,25 +1417,13 @@ export default function App() {
               </p>
             </div>
 
-            {/* Busca por código ou e-mail */}
-            <form
-              onSubmit={buscarReservasRemotasCliente}
-              className="flex gap-2"
-            >
-              <input
-                type="text"
-                value={buscaVoucherCliente}
-                onChange={(e) => setBuscaVoucherCliente(e.target.value)}
-                placeholder="Filtrar por código BRQ-XXXXXX ou e-mail..."
-                className="flex-1 border border-slate-200 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-orange-500"
-              />
-              <button
-                type="submit"
-                className="bg-slate-900 text-white text-xs font-bold px-3.5 py-2 rounded-xl"
-              >
-                Buscar
-              </button>
-            </form>
+            <input
+              type="text"
+              value={buscaVoucherCliente}
+              onChange={(e) => setBuscaVoucherCliente(e.target.value)}
+              placeholder="Filtrar por código BRQ-XXXXXX, restaurante ou e-mail..."
+              className="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-orange-500"
+            />
 
             {minhasReservas.length === 0 ? (
               <div className="bg-slate-50 border border-slate-200 rounded-2xl p-6 text-center space-y-2">
@@ -1268,11 +1551,10 @@ export default function App() {
         )}
 
         {/* =========================================================
-            ABA 3: PAINEL DO RESTAURANTE PARCEIRO (PASSO 2)
+            ABA 3: PAINEL DO RESTAURANTE PARCEIRO
            ========================================================= */}
         {abaPrincipal === "restaurante" && (
           <section className="px-4 mt-4 flex-1 space-y-4">
-            {/* Seletor do Restaurante Parceiro */}
             <div className="bg-slate-900 text-white rounded-2xl p-3.5 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-[11px] font-bold uppercase tracking-wider text-orange-400 flex items-center gap-1">
@@ -1325,7 +1607,7 @@ export default function App() {
               </div>
             )}
 
-            {/* 1. VALIDADOR / CHECK-IN DE VOUCHER */}
+            {/* 1. VALIDADOR DE VOUCHER */}
             <div className="bg-white border border-slate-200 rounded-2xl p-3.5 shadow-sm space-y-2.5">
               <h3 className="text-xs font-extrabold uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
                 <QrCode className="w-4 h-4 text-orange-600" />
@@ -1367,7 +1649,6 @@ export default function App() {
                 />
               </div>
 
-              {/* Resumo Rápido */}
               <div className="grid grid-cols-3 gap-2 text-center">
                 <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-2">
                   <span className="text-base font-extrabold text-emerald-700 block">
@@ -1486,7 +1767,7 @@ export default function App() {
               )}
             </div>
 
-            {/* 3. GESTÃO DO CUPOM DE HORÁRIO OCIOSO */}
+            {/* 3. GESTÃO DO CUPOM */}
             <form
               onSubmit={salvarCupomRestaurante}
               className="bg-white border border-slate-200 rounded-2xl p-3.5 shadow-sm space-y-3"
@@ -1538,7 +1819,7 @@ export default function App() {
               </button>
             </form>
 
-            {/* 4. GESTÃO RÁPIDA DE MESAS */}
+            {/* 4. GESTÃO DE MESAS */}
             <div className="bg-white border border-slate-200 rounded-2xl p-3.5 shadow-sm space-y-3">
               <h3 className="text-xs font-extrabold uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
                 <Users className="w-4 h-4 text-orange-600" />
@@ -1608,13 +1889,10 @@ export default function App() {
           </section>
         )}
 
-        {/* =========================================================
-            MODAL DO FLUXO DE RESERVA (PASSO 1)
-           ========================================================= */}
+        {/* MODAL DE RESERVA INSTANTÂNEA */}
         {restauranteSelecionado && (
           <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
             <div className="bg-white w-full max-w-md rounded-t-3xl sm:rounded-3xl p-5 shadow-2xl max-h-[92vh] overflow-y-auto animate-in slide-in-from-bottom">
-              {/* Cabeçalho do Modal */}
               <div className="flex items-start justify-between border-b border-slate-100 pb-3">
                 <div>
                   <span className="text-xs font-bold text-orange-600 uppercase">
@@ -1638,7 +1916,6 @@ export default function App() {
 
               {!reservaConfirmada ? (
                 <form onSubmit={confirmarReserva} className="space-y-4 mt-4">
-                  {/* Banner Dinâmico do Cupom conforme o Horário Selecionado */}
                   {restauranteSelecionado.cupom_destaque &&
                   restauranteSelecionado.desconto_percentual > 0 ? (
                     slotSelecionadoInfo.ocioso ? (
@@ -1674,7 +1951,6 @@ export default function App() {
                     )
                   ) : null}
 
-                  {/* Data e Quantidade de Pessoas */}
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs font-bold text-slate-700 mb-1 flex items-center gap-1">
@@ -1709,7 +1985,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Seleção de Horário com Disponibilidade Real */}
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
                       <label className="text-xs font-bold text-slate-700 flex items-center gap-1">
@@ -1774,7 +2049,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Dados do Cliente */}
                   <div className="space-y-2.5 pt-2 border-t border-slate-100">
                     <p className="text-xs font-bold text-slate-700">
                       Seus dados para gerar o voucher
@@ -1829,7 +2103,6 @@ export default function App() {
                   </button>
                 </form>
               ) : (
-                /* TELA 2: VOUCHER DE CONFIRMAÇÃO COM QR CODE E WHATSAPP */
                 <div className="mt-5 text-center space-y-4">
                   <div className="w-14 h-14 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mx-auto">
                     <CheckCircle2 className="w-8 h-8" />
@@ -1844,7 +2117,6 @@ export default function App() {
                     </p>
                   </div>
 
-                  {/* Voucher Card */}
                   <div className="bg-slate-50 border-2 border-dashed border-slate-300 rounded-2xl p-4 text-left space-y-3">
                     <div className="flex justify-between items-center">
                       <div>
@@ -1894,7 +2166,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Botões de Ação Rápida do Voucher */}
                   <div className="grid grid-cols-2 gap-2">
                     <a
                       href={gerarLinkWhatsAppVoucher(reservaConfirmada)}
@@ -1934,7 +2205,7 @@ export default function App() {
           </div>
         )}
 
-        {/* MODAL DE DETALHE DO VOUCHER (ABERTO PELA CARTEIRA) */}
+        {/* MODAL DE DETALHE DO VOUCHER */}
         {voucherDetalhe && (
           <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
             <div className="bg-white w-full max-w-sm rounded-3xl p-5 shadow-2xl space-y-4 text-center">
@@ -1989,9 +2260,7 @@ export default function App() {
           </div>
         )}
 
-        {/* =========================================================
-            BARRA DE NAVEGAÇÃO INFERIOR (CLIENTE vs RESTAURANTE)
-           ========================================================= */}
+        {/* BARRA DE NAVEGAÇÃO INFERIOR */}
         <nav className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-md bg-white/95 backdrop-blur-md border-t border-slate-200 px-4 py-2 flex items-center justify-around z-40">
           <button
             onClick={() => setAbaPrincipal("explorar")}
@@ -2002,7 +2271,7 @@ export default function App() {
             }`}
           >
             <MapPin className="w-5 h-5" />
-            <span className="text-[11px]">Explorar</span>
+            <span className="text-[11px]">Explorar + IA</span>
           </button>
 
           <button
