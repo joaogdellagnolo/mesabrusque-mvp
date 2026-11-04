@@ -16,7 +16,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="MesaBrusque API",
     description="API de descoberta de restaurantes, cupons de horários ociosos e reservas em Brusque/SC",
-    version="0.1.0"
+    version="0.2.0"
 )
 
 app.add_middleware(
@@ -119,8 +119,38 @@ seed_initial_data()
 
 
 # ==========================================
+# REGRAS DE HORÁRIOS E CUPONS OCIOSOS
+# ==========================================
+HORARIO_LIMITE_OCIOSO = time(19, 30)
+
+HORARIOS_PADRAO = [
+    {"hora": time(18, 30), "label": "18:30", "ocioso": True, "bonus": "Horário VIP (+Desconto Garantido)"},
+    {"hora": time(19, 0),  "label": "19:00", "ocioso": True, "bonus": "Horário VIP (+Desconto Garantido)"},
+    {"hora": time(19, 30), "label": "19:30", "ocioso": True, "bonus": "Último horário com cupom máximo"},
+    {"hora": time(20, 0),  "label": "20:00", "ocioso": False, "bonus": "Alta procura (Sem cupom ocioso)"},
+    {"hora": time(20, 30), "label": "20:30", "ocioso": False, "bonus": "Alta procura (Sem cupom ocioso)"},
+    {"hora": time(21, 0),  "label": "21:00", "ocioso": False, "bonus": "Horário normal"},
+]
+
+
+# ==========================================
 # SCHEMAS (Pydantic)
 # ==========================================
+
+class MesaOut(BaseModel):
+    id: int
+    identificador: str
+    capacidade: int
+    ativa: bool
+
+    class Config:
+        from_attributes = True
+
+
+class MesaCreate(BaseModel):
+    identificador: str = Field(..., min_length=2, max_length=20)
+    capacidade: int = Field(..., gt=0, le=20)
+
 
 class RestauranteOut(BaseModel):
     id: int
@@ -140,6 +170,21 @@ class RestauranteOut(BaseModel):
         from_attributes = True
 
 
+class CupomUpdate(BaseModel):
+    cupom_destaque: Optional[str] = Field(None, max_length=100)
+    desconto_percentual: int = Field(0, ge=0, le=80)
+
+
+class SlotDisponibilidadeOut(BaseModel):
+    hora: str
+    ocioso: bool
+    bonus: str
+    disponivel: bool
+    mesas_livres: int
+    desconto_aplicavel: int
+    cupom_aplicavel: Optional[str]
+
+
 class ReservaCreate(BaseModel):
     restaurante_id: int
     data_reserva: date
@@ -153,17 +198,43 @@ class ReservaCreate(BaseModel):
 class ReservaOut(BaseModel):
     id: int
     codigo_confirmacao: str
+    restaurante_id: int
     restaurante_nome: str
+    restaurante_endereco: str
+    restaurante_bairro: str
     mesa_identificador: str
     data_reserva: date
     horario_reserva: time
     qtd_pessoas: int
     cupom_aplicado: Optional[str]
     status: StatusReserva
+    nome_usuario: str
+    email_usuario: str
+    telefone_usuario: str
+
+
+def montar_reserva_out(reserva: Reserva) -> ReservaOut:
+    return ReservaOut(
+        id=reserva.id,
+        codigo_confirmacao=reserva.codigo_confirmacao,
+        restaurante_id=reserva.restaurante.id,
+        restaurante_nome=reserva.restaurante.nome,
+        restaurante_endereco=reserva.restaurante.endereco,
+        restaurante_bairro=reserva.restaurante.bairro,
+        mesa_identificador=reserva.mesa.identificador,
+        data_reserva=reserva.data_reserva,
+        horario_reserva=reserva.horario_reserva,
+        qtd_pessoas=reserva.qtd_pessoas,
+        cupom_aplicado=reserva.cupom_aplicado,
+        status=reserva.status,
+        nome_usuario=reserva.usuario.nome,
+        email_usuario=reserva.usuario.email,
+        telefone_usuario=reserva.usuario.telefone,
+    )
 
 
 # ==========================================
-# ROTAS DA API
+# ROTAS DA API — CLIENTE & DESCOBERTA
 # ==========================================
 
 @app.get("/restaurantes", response_model=List[RestauranteOut])
@@ -188,6 +259,60 @@ def listar_restaurantes(
         resultado.append(rest_dict)
 
     return resultado
+
+
+@app.get("/restaurantes/{restaurante_id}/disponibilidade", response_model=List[SlotDisponibilidadeOut])
+def consultar_disponibilidade(
+    restaurante_id: int,
+    data_reserva: date = Query(..., description="Data desejada para a reserva"),
+    qtd_pessoas: int = Query(2, gt=0, le=20, description="Quantidade de pessoas"),
+    db: Session = Depends(get_db)
+):
+    restaurante = db.get(Restaurante, restaurante_id)
+    if not restaurante or not restaurante.ativo:
+        raise HTTPException(status_code=404, detail="Restaurante não encontrado ou inativo.")
+
+    mesas_compativeis = db.scalars(
+        select(Mesa).where(
+            and_(
+                Mesa.restaurante_id == restaurante_id,
+                Mesa.ativa == True,
+                Mesa.capacidade >= qtd_pessoas
+            )
+        )
+    ).all()
+    ids_mesas_compativeis = {m.id for m in mesas_compativeis}
+
+    reservas_ativas_dia = db.scalars(
+        select(Reserva).where(
+            and_(
+                Reserva.restaurante_id == restaurante_id,
+                Reserva.data_reserva == data_reserva,
+                Reserva.status.in_([StatusReserva.PENDENTE, StatusReserva.CONFIRMADA])
+            )
+        )
+    ).all()
+
+    slots = []
+    for slot in HORARIOS_PADRAO:
+        ocupadas_no_horario = {
+            r.mesa_id for r in reservas_ativas_dia if r.horario_reserva == slot["hora"]
+        }
+        livres = len(ids_mesas_compativeis - ocupadas_no_horario)
+        tem_cupom = slot["ocioso"] and restaurante.desconto_percentual > 0 and bool(restaurante.cupom_destaque)
+        slots.append(
+            SlotDisponibilidadeOut(
+                hora=slot["label"],
+                ocioso=slot["ocioso"],
+                bonus=slot["bonus"],
+                disponivel=livres > 0,
+                mesas_livres=livres,
+                desconto_aplicavel=restaurante.desconto_percentual if tem_cupom else 0,
+                cupom_aplicavel=restaurante.cupom_destaque if tem_cupom else None,
+            )
+        )
+
+    return slots
 
 
 @app.post("/reservas", response_model=ReservaOut, status_code=status.HTTP_201_CREATED)
@@ -238,8 +363,20 @@ def criar_reserva(payload: ReservaCreate, db: Session = Depends(get_db)):
         )
         db.add(usuario)
         db.flush()
+    else:
+        usuario.nome = payload.nome_usuario
+        usuario.telefone = payload.telefone_usuario
+        db.flush()
 
     codigo = f"BRQ-{uuid.uuid4().hex[:6].upper()}"
+
+    # Regra do MVP: Cupom só é aplicado se o horário reservado for ocioso (<= 19:30) e o restaurante tiver desconto ativo
+    horario_eh_ocioso = payload.horario_reserva <= HORARIO_LIMITE_OCIOSO
+    cupom_aplicado = (
+        restaurante.cupom_destaque
+        if (horario_eh_ocioso and restaurante.desconto_percentual > 0)
+        else None
+    )
 
     nova_reserva = Reserva(
         usuario_id=usuario.id,
@@ -248,7 +385,7 @@ def criar_reserva(payload: ReservaCreate, db: Session = Depends(get_db)):
         data_reserva=payload.data_reserva,
         horario_reserva=payload.horario_reserva,
         qtd_pessoas=payload.qtd_pessoas,
-        cupom_aplicado=restaurante.cupom_destaque,
+        cupom_aplicado=cupom_aplicado,
         codigo_confirmacao=codigo,
         status=StatusReserva.CONFIRMADA
     )
@@ -257,15 +394,159 @@ def criar_reserva(payload: ReservaCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(nova_reserva)
 
-    return ReservaOut(
-        id=nova_reserva.id,
-        codigo_confirmacao=nova_reserva.codigo_confirmacao,
-        restaurante_nome=restaurante.nome,
-        mesa_identificador=mesa_disponivel.identificador,
-        data_reserva=nova_reserva.data_reserva,
-        horario_reserva=nova_reserva.horario_reserva,
-        qtd_pessoas=nova_reserva.qtd_pessoas,
-        cupom_aplicado=nova_reserva.cupom_aplicado,
-        status=nova_reserva.status
-    )
+    return montar_reserva_out(nova_reserva)
 
+
+@app.get("/reservas", response_model=List[ReservaOut])
+def consultar_reservas_cliente(
+    email: Optional[str] = Query(None, description="Filtrar reservas pelo e-mail do cliente"),
+    codigo: Optional[str] = Query(None, description="Filtrar pelo código do voucher BRQ-XXXXXX"),
+    db: Session = Depends(get_db)
+):
+    query = select(Reserva).join(Usuario)
+    if codigo:
+        query = query.where(Reserva.codigo_confirmacao == codigo.strip().upper())
+    elif email:
+        query = query.where(Usuario.email.ilike(email.strip()))
+    else:
+        raise HTTPException(status_code=400, detail="Informe o e-mail ou o código do voucher para consultar.")
+
+    reservas = db.scalars(query.order_by(Reserva.data_reserva.desc(), Reserva.horario_reserva.desc())).all()
+    return [montar_reserva_out(r) for r in reservas]
+
+
+@app.get("/reservas/{codigo}", response_model=ReservaOut)
+def buscar_reserva_por_codigo(codigo: str, db: Session = Depends(get_db)):
+    reserva = db.scalars(
+        select(Reserva).where(Reserva.codigo_confirmacao == codigo.strip().upper())
+    ).first()
+    if not reserva:
+        raise HTTPException(status_code=404, detail="Voucher não encontrado.")
+    return montar_reserva_out(reserva)
+
+
+@app.patch("/reservas/{codigo}/cancelar", response_model=ReservaOut)
+def cancelar_reserva(codigo: str, db: Session = Depends(get_db)):
+    reserva = db.scalars(
+        select(Reserva).where(Reserva.codigo_confirmacao == codigo.strip().upper())
+    ).first()
+    if not reserva:
+        raise HTTPException(status_code=404, detail="Reserva não encontrada.")
+    if reserva.status == StatusReserva.CONCLUIDA:
+        raise HTTPException(status_code=400, detail="Esta reserva já foi concluída (check-in realizado).")
+    if reserva.status == StatusReserva.CANCELADA:
+        raise HTTPException(status_code=400, detail="Esta reserva já está cancelada.")
+
+    reserva.status = StatusReserva.CANCELADA
+    db.commit()
+    db.refresh(reserva)
+    return montar_reserva_out(reserva)
+
+
+# ==========================================
+# ROTAS DA API — PAINEL DO RESTAURANTE
+# ==========================================
+
+@app.get("/restaurantes/{restaurante_id}/reservas", response_model=List[ReservaOut])
+def listar_reservas_restaurante(
+    restaurante_id: int,
+    data_reserva: Optional[date] = Query(None, description="Data para filtrar a fila do dia"),
+    db: Session = Depends(get_db)
+):
+    restaurante = db.get(Restaurante, restaurante_id)
+    if not restaurante:
+        raise HTTPException(status_code=404, detail="Restaurante não encontrado.")
+
+    query = select(Reserva).where(Reserva.restaurante_id == restaurante_id)
+    if data_reserva:
+        query = query.where(Reserva.data_reserva == data_reserva)
+
+    reservas = db.scalars(query.order_by(Reserva.data_reserva.asc(), Reserva.horario_reserva.asc())).all()
+    return [montar_reserva_out(r) for r in reservas]
+
+
+@app.patch("/reservas/{codigo}/checkin", response_model=ReservaOut)
+def realizar_checkin_voucher(codigo: str, db: Session = Depends(get_db)):
+    reserva = db.scalars(
+        select(Reserva).where(Reserva.codigo_confirmacao == codigo.strip().upper())
+    ).first()
+    if not reserva:
+        raise HTTPException(status_code=404, detail="Código de voucher inválido ou não encontrado.")
+    if reserva.status == StatusReserva.CANCELADA:
+        raise HTTPException(status_code=400, detail="Este voucher foi cancelado e não pode ser utilizado.")
+    if reserva.status == StatusReserva.CONCLUIDA:
+        raise HTTPException(status_code=400, detail="Check-in já foi realizado anteriormente para este voucher.")
+
+    reserva.status = StatusReserva.CONCLUIDA
+    db.commit()
+    db.refresh(reserva)
+    return montar_reserva_out(reserva)
+
+
+@app.patch("/restaurantes/{restaurante_id}/cupom", response_model=RestauranteOut)
+def atualizar_cupom_restaurante(
+    restaurante_id: int,
+    payload: CupomUpdate,
+    db: Session = Depends(get_db)
+):
+    restaurante = db.get(Restaurante, restaurante_id)
+    if not restaurante:
+        raise HTTPException(status_code=404, detail="Restaurante não encontrado.")
+
+    restaurante.desconto_percentual = payload.desconto_percentual
+    restaurante.cupom_destaque = (
+        payload.cupom_destaque.strip()
+        if (payload.cupom_destaque and payload.desconto_percentual > 0)
+        else None
+    )
+    db.commit()
+    db.refresh(restaurante)
+
+    rest_dict = RestauranteOut.model_validate(restaurante)
+    rest_dict.total_mesas = len([m for m in restaurante.mesas if m.ativa])
+    return rest_dict
+
+
+@app.get("/restaurantes/{restaurante_id}/mesas", response_model=List[MesaOut])
+def listar_mesas_restaurante(restaurante_id: int, db: Session = Depends(get_db)):
+    restaurante = db.get(Restaurante, restaurante_id)
+    if not restaurante:
+        raise HTTPException(status_code=404, detail="Restaurante não encontrado.")
+    return restaurante.mesas
+
+
+@app.post("/restaurantes/{restaurante_id}/mesas", response_model=MesaOut, status_code=status.HTTP_201_CREATED)
+def adicionar_mesa_restaurante(
+    restaurante_id: int,
+    payload: MesaCreate,
+    db: Session = Depends(get_db)
+):
+    restaurante = db.get(Restaurante, restaurante_id)
+    if not restaurante:
+        raise HTTPException(status_code=404, detail="Restaurante não encontrado.")
+
+    nova_mesa = Mesa(
+        restaurante_id=restaurante_id,
+        identificador=payload.identificador.strip(),
+        capacidade=payload.capacidade,
+        ativa=True
+    )
+    db.add(nova_mesa)
+    try:
+        db.commit()
+        db.refresh(nova_mesa)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Já existe uma mesa com esse identificador neste restaurante.")
+    return nova_mesa
+
+
+@app.patch("/mesas/{mesa_id}/toggle", response_model=MesaOut)
+def alternar_status_mesa(mesa_id: int, db: Session = Depends(get_db)):
+    mesa = db.get(Mesa, mesa_id)
+    if not mesa:
+        raise HTTPException(status_code=404, detail="Mesa não encontrada.")
+    mesa.ativa = not mesa.ativa
+    db.commit()
+    db.refresh(mesa)
+    return mesa
